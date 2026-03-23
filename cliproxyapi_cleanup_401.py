@@ -1,7 +1,9 @@
-import os, sys, re, json, argparse, time
+import os, sys, re, json, argparse, time, configparser
 from pathlib import Path
 from urllib import request, parse, error
 from datetime import datetime, timezone
+
+CONFIG_PATH = Path(__file__).parent / 'config.ini'
 
 P401 = re.compile(r'(^|\D)401(\D|$)|unauthorized|unauthenticated|token\s+expired|login\s+required|authentication\s+failed', re.I)
 PQUOTA = re.compile(r'(^|\D)(402|403|429)(\D|$)|quota|insufficient\s*quota|resource\s*exhausted|rate\s*limit|too\s+many\s+requests|payment\s+required|billing|credit|额度|用完|超限|上限|usage_limit_reached', re.I)
@@ -114,6 +116,7 @@ def run_check(args):
         '已禁用': 0,
         '不可用': 0,
         '待删除401': 0,
+        '待删除配额耗尽': 0,
         '已删除': 0,
         '备份失败': 0,
         '删除失败': 0,
@@ -164,7 +167,41 @@ def run_check(args):
             
         elif kind == 'quota_exhausted':
             counts['配额耗尽'] += 1
-            print('[配额耗尽-不删除] %s provider=%s reason=%s' % (name, provider, display_reason), flush=True)
+            counts['待删除配额耗尽'] += 1
+            print('[待删除-配额耗尽] %s provider=%s reason=%s' % (name, provider, display_reason), flush=True)
+
+            # 配额耗尽也进入删除流程
+            if args.dry_run:
+                row['delete_result'] = 'dry_run_skip'
+                print('  [模拟运行] 将删除此文件', flush=True)
+            else:
+                if not name.lower().endswith('.json'):
+                    counts['备份失败'] += 1
+                    row['delete_result'] = 'skip_no_json_name'
+                    row['delete_error'] = '不是标准 .json 文件名，默认不删'
+                    print('  [跳过] 不是 .json 文件', flush=True)
+                else:
+                    try:
+                        code, raw = api(args.base_url, args.management_key, 'GET', '/auth-files/download', args.timeout, {'name': name}, False)
+                        if code != 200:
+                            raise RuntimeError('下载 auth 文件失败: %s HTTP %s' % (name, code))
+                        backup_root.mkdir(parents=True, exist_ok=True)
+                        backup_path = backup_root / Path(name).name
+                        backup_path.write_bytes(raw)
+                        row['backup_path'] = str(backup_path)
+
+                        code, payload = api(args.base_url, args.management_key, 'DELETE', '/auth-files', args.timeout, {'name': name}, True)
+                        if code != 200:
+                            raise RuntimeError('删除 auth 文件失败: %s HTTP %s %s' % (name, code, payload))
+                        counts['已删除'] += 1
+                        row['delete_result'] = 'deleted'
+                        row['delete_response'] = payload
+                        print('  [已删除] 备份路径: %s' % row['backup_path'], flush=True)
+                    except Exception as e:
+                        counts['删除失败'] += 1
+                        row['delete_result'] = 'delete_failed'
+                        row['delete_error'] = str(e)
+                        print('  [删除失败] %s' % e, flush=True)
             
         elif kind == 'disabled':
             counts['已禁用'] += 1
@@ -234,17 +271,19 @@ def run_check(args):
         print('  %s: %d' % (key, value))
     
     print('\n【操作说明】')
+    total_to_delete = counts['待删除401'] + counts['待删除配额耗尽']
     if args.dry_run:
         print('  ✅ 模拟运行模式 - 没有实际删除任何文件')
-        if counts['待删除401'] > 0:
-            print('  📝 发现 %d 个 401 认证失败的账号（如需删除请去掉 --dry-run 参数）' % counts['待删除401'])
+        if total_to_delete > 0:
+            print('  📝 发现 %d 个待删除账号（401: %d, 配额耗尽: %d）' % (total_to_delete, counts['待删除401'], counts['待删除配额耗尽']))
+            print('  📝 如需删除请去掉 --dry-run 参数')
     else:
-        if counts['待删除401'] > 0:
-            print('  ✅ 实际运行模式 - 已删除 %d 个 401 认证失败的账号' % counts['已删除'])
+        if total_to_delete > 0:
+            print('  ✅ 实际运行模式 - 已删除 %d 个账号（401: %d, 配额耗尽: %d）' % (counts['已删除'], counts['待删除401'], counts['待删除配额耗尽']))
             if counts['删除失败'] > 0:
                 print('  ⚠️  有 %d 个账号删除失败，请查看报告' % counts['删除失败'])
         else:
-            print('  ℹ️  未发现需要删除的 401 认证失败账号')
+            print('  ℹ️  未发现需要删除的账号')
     
     print('\n【报告文件】')
     print('  📄 %s' % report_path)
@@ -252,10 +291,21 @@ def run_check(args):
     
     return counts
 
+def load_config():
+    cfg = configparser.ConfigParser()
+    if CONFIG_PATH.exists():
+        cfg.read(str(CONFIG_PATH), encoding='utf-8')
+    section = 'cliproxyapi'
+    return {
+        'base_url': cfg.get(section, 'base-url', fallback=''),
+        'management_key': cfg.get(section, 'management-key', fallback=''),
+    }
+
 def main():
-    ap = argparse.ArgumentParser(description='CLIProxyAPI 清理工具 - 只删除 401 认证失败的账号')
-    ap.add_argument('--base-url', default='http://127.0.0.1:8317')  # 直接指定
-    ap.add_argument('--management-key', default='admin888')  # 直接指定
+    defaults = load_config()
+    ap = argparse.ArgumentParser(description='CLIProxyAPI 清理工具 - 删除 401 认证失败和配额耗尽的账号')
+    ap.add_argument('--base-url', default=defaults['base_url'])
+    ap.add_argument('--management-key', default=defaults['management_key'])
     ap.add_argument('--timeout', type=int, default=int(os.environ.get('CLIPROXY_TIMEOUT', '20')))
     ap.add_argument('--dry-run', action='store_true', help='模拟运行，不实际删除')
     ap.add_argument('--interval', type=int, default=60, help='检测间隔时间（秒），默认60秒')
@@ -269,8 +319,8 @@ def main():
     print('\n' + '='*60)
     print('【CLIProxyAPI 清理工具】')
     print('='*60)
-    print('  🎯 清理目标: 只删除 401 认证失败的账号')
-    print('  🛡️  保护机制: 配额耗尽、禁用、不可用账号不会被删除')
+    print('  🎯 清理目标: 删除 401 认证失败和配额耗尽的账号')
+    print('  🛡️  保护机制: 禁用、不可用账号不会被删除')
     if args.dry_run:
         print('  🔍 运行模式: 模拟运行（不会实际删除）')
     else:
