@@ -9,6 +9,6 @@ wheels/
 # Virtual environments
 .venv
 
-.backups
-.reports
+backups
+reports
 config.ini
