@@ -1,0 +1,7 @@
+services:
+  cleanup:
+    image: ghcr.io/yiranxiaohui/cliproxyapi_utils:main
+    container_name: cliproxyapi-cleanup
+    restart: "no"
+    volumes:
+      - ./config.ini:/app/config.ini:ro
